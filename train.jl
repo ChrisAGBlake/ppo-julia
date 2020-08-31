@@ -68,13 +68,15 @@ function discount_cumsum(values, discount_array)
     return res
 end
 
-function policy_loss(actor, act_log_std, states, actions, adv_est)
+function policy_loss(actor, act_log_std, states, actions, adv_est, log_prob_old, ϵ)
     μ = actor(states)
     σ = exp(act_log_std)  
     v = σ^2
     log_scale = log(σ)
     log_prob = -((actions .- μ').^2) ./ (2 * v) .- log_scale .- log(sqrt(2 * π))
-    loss = -mean(log_prob .* adv_est)
+    ratio = exp.(log_prob .- log_prob_old)
+    clip_adv = clamp.(ratio, 1-ϵ, 1+ϵ) .* adv_est
+    loss = -mean(min.(ratio .* adv_est, clip_adv))
     return loss
 end
 
@@ -84,13 +86,16 @@ function value_loss(critic, states, rewards2go)
     return mean(loss)
 end
 
-function train(n_epochs, batch_size)
+function train()
 
     # set hyper parameters
     γ = 0.99
     λ = 0.97
-
+    ϵ = 0.2
     max_steps = 200
+    n_updates = 10
+    batch_size = 1000
+    n_epochs = 100
     gamma_arr = Array{Float32}(undef, max_steps)
     gamma_lam_arr = Array{Float32}(undef, max_steps)
     for i = 1:max_steps
@@ -167,18 +172,25 @@ function train(n_epochs, batch_size)
         adv_buf = (adv_buf .- μ) ./ σ
 
         # update the policy network
-        p_grad = gradient(act_params) do 
-            p_loss = policy_loss(actor, act_log_std, states_buf, actions_buf, adv_buf)
-            return p_loss
+        for j = 1:n_updates
+            p_grad = gradient(act_params) do 
+                p_loss = policy_loss(actor, act_log_std, states_buf, actions_buf, adv_buf, log_probs_buf, ϵ)
+                return p_loss
+            end
+            update!(act_optimiser, act_params, p_grad)
+
+            # stop updates if kl gets too large (this isn't in stable baselines)
+            # TODO implement this if useful
         end
-        update!(act_optimiser, act_params, p_grad)
 
         # update the value network
-        v_grad = gradient(crt_params) do
-            v_loss = value_loss(critic, states_buf, r2g_buf)
-            return v_loss
+        for j = 1:n_updates
+            v_grad = gradient(crt_params) do
+                v_loss = value_loss(critic, states_buf, r2g_buf)
+                return v_loss
+            end
+            update!(crt_optimiser, crt_params, v_grad)
         end
-        update!(crt_optimiser, crt_params, v_grad)
 
         println("step time: ", now() - st)
     end
@@ -186,9 +198,7 @@ function train(n_epochs, batch_size)
 end
 
 ini = now()
-batch_size = 1000
-n_epochs = 100
-res = train(n_epochs, batch_size)
+res = train()
 println("total time: ", now() - ini)
 # # plot results
 # x = 1:n_epochs
