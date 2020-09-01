@@ -1,9 +1,10 @@
 module CartPoleEnv
-export env_step, env_reset, state_size
+export env_step, env_reset, state_size, action_size
 
 using Random
 
 state_size = 4
+action_size = 1
 idx_x = 1
 idx_v = 2
 idx_theta = 3
@@ -20,7 +21,7 @@ theta_threshold = deg2rad(12)
 x_threshold = 2.4
 
 function env_step(state, action)
-    force = force_mag * action
+    force = force_mag * action[1]
     cos_theta = cos(state[idx_theta])
     sin_theta = sin(state[idx_theta])
     temp = (force + pole_mass_length * state[idx_omega]^2 * sin_theta) / total_mass
