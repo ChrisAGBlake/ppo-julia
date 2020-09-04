@@ -4,6 +4,7 @@ using Flux, Distributions
 using Flux: params, update!
 using Statistics: mean
 using Dates: now
+using CUDA
 
 function act(actor, act_log_std, state)
     σ = exp.(act_log_std)
@@ -123,8 +124,8 @@ function train()
     for i = 1:action_size
         act_log_std[i] = -0.5
     end
-    act_optimiser = ADAM(3e-4)
-    act_params = params(actor, act_log_std)
+    act_optimiser = ADAM(3e-4) |> gpu
+    # act_params = params(actor, act_log_std)
 
     # create the value network and optimiser
     critic = Chain(
@@ -132,8 +133,8 @@ function train()
         Dense(128, 128, relu),
         Dense(128, 1)
     )
-    crt_optimiser = ADAM(3e-4)
-    crt_params = params(critic)
+    crt_optimiser = ADAM(3e-4) |> gpu
+    # crt_params = params(critic)
 
     # run n_epochs updates
     for i = 1:n_epochs
@@ -185,6 +186,18 @@ function train()
         σ = std(adv_buf)
         adv_buf = (adv_buf .- μ) ./ σ
         
+        #shift to the gpu
+        actor = actor |> gpu
+        act_log_std = act_log_std |> gpu
+        act_params = params(actor, act_log_std)
+        critic = critic |> gpu
+        crt_params = params(critic)
+        states_buf = states_buf |> gpu
+        actions_buf = actions_buf |> gpu
+        adv_buf = adv_buf |> gpu
+        log_probs_buf = log_probs_buf |> gpu
+        r2g_buf = r2g_buf |> gpu
+
         # update the policy network
         for j = 1:n_p_updates
             p_grad = gradient(() -> policy_loss(actor, act_log_std, states_buf, actions_buf, adv_buf, log_probs_buf, ϵ, c), act_params)
@@ -200,6 +213,16 @@ function train()
         end
         println("time to update value function: ", now() - st)
         println()
+
+        #shift to the cpu
+        actor = actor |> cpu
+        act_log_std = act_log_std |> cpu
+        critic = critic |> cpu
+        states_buf = states_buf |> cpu
+        actions_buf = actions_buf |> cpu
+        adv_buf = adv_buf |> cpu
+        log_probs_buf = log_probs_buf |> cpu
+        r2g_buf = r2g_buf |> cpu
         
     end
 end
