@@ -108,7 +108,7 @@ function train()
     n_epochs = 1000
     gamma_arr = Array{Float32}(undef, max_steps)
     gamma_lam_arr = Array{Float32}(undef, max_steps)
-    for i = 1:max_steps
+    for i = eachindex(gamma_arr)
         gamma_arr[i] = γ ^ (i-1)
         gamma_lam_arr[i] = (γ * λ) ^ (i-1)
     end
@@ -120,7 +120,7 @@ function train()
         Dense(128, 1)
     )
     act_log_std = Array{Float32}(undef, action_size)
-    for i = 1:action_size
+    for i = eachindex(act_log_std)
         act_log_std[i] = -0.5
     end
     act_optimiser = ADAM(3e-4)
