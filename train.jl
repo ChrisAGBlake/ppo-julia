@@ -5,9 +5,11 @@ using Flux: params, update!
 using Statistics: mean
 using Dates: now
 
-function act(actor, act_log_std, state)
+function act(actor_critic, act_log_std, state)
     σ = exp.(act_log_std)
-    μ = actor(state)
+    μ = actor_critic(state)
+    value = μ[end]
+    μ = view(μ, 1:action_size)
 
     # sample an action from a normal distribution with mean μ and standard deviation σ
     d = Normal.(μ, σ)
@@ -18,15 +20,16 @@ function act(actor, act_log_std, state)
     log_scale = log.(σ)
     log_prob = -((action .- μ).^2) ./ (2 .* v) .- log_scale .- log(sqrt(2 * π))
 
-    return action, log_prob
+    return action, log_prob, value
 end
 
-function run_episode(actor, act_log_std, critic, max_steps)
+function run_episode(actor_critic, act_log_std, max_steps)
     states = Array{Float32}(undef, state_size, max_steps)
     actions = Array{Float32}(undef, action_size, max_steps)
     combined_actions = Array{Float32}(undef, action_size * 2)
     log_probs = Array{Float32}(undef, action_size, max_steps)
-    rewards = Array{Float32}(undef, max_steps + 1)
+    rewards = Array{Float32}(undef, max_steps)
+    values = Array{Float32}(undef, max_steps + 1)
     state = Array{Float32}(undef, state_size)
     norm_state = Array{Float32}(undef, state_size)
     row_buffer = Array{Float32}(undef, floor(Int, 2 / dt))
@@ -42,9 +45,10 @@ function run_episode(actor, act_log_std, critic, max_steps)
         states[:,i] = norm_state[:]
 
         # get action, log prob of action and value estimate
-        action, log_prob = act(actor, act_log_std, norm_state)
+        action, log_prob, value = act(actor_critic, act_log_std, norm_state)
         actions[:,i] = action[:]
         log_probs[:,i] = log_prob[:]
+        values[i] = value
 
         # get the opponents actions
         for j = eachindex(action)
@@ -65,7 +69,7 @@ function run_episode(actor, act_log_std, critic, max_steps)
             break
         end
     end
-    values = critic(view(states, :, 1:n_steps+1))
+    # values = critic(view(states, :, 1:n_steps+1))
     # set the final value to 0
     values[n_steps + 1] = 0
     return view(states, :, 1:n_steps), view(actions, :, 1:n_steps), view(log_probs, :, 1:n_steps), view(rewards, 1:n_steps), view(values, 1:n_steps + 1)
@@ -98,6 +102,22 @@ function value_loss(critic, states, rewards2go)
     return mean(loss)
 end
 
+function ac_loss(actor_critic, act_log_std, states, actions, adv_est, log_prob_old, ϵ, c, rewards2go)
+    μ = actor_critic(states)
+    values = view(μ, action_size+1,:)
+    μ = view(μ, 1:action_size,:)
+    σ = exp.(act_log_std)  
+    v = σ.^2
+    log_scale = log.(σ)
+    log_prob = -((actions .- μ).^2) ./ (2 .* v) .- log_scale .- c
+    ratio = exp.(log_prob .- log_prob_old)
+    clip_adv = clamp.(ratio, 1-ϵ, 1+ϵ) .* adv_est'
+    p_loss = -mean(min.(ratio .* adv_est', clip_adv))
+    v_loss = mean((values .- rewards2go) .^ 2)
+    loss = p_loss + v_loss
+    return loss
+end
+
 function train()
 
     # initialise results file
@@ -121,30 +141,19 @@ function train()
     end
 
     # create the policy network and optimiser
-    actor = Chain(
+    actor_critic = Chain(
         Dense(state_size, 256, relu),
         Dense(256, 512, relu),
         Dense(512, 512, relu),
         Dense(512, 256, relu),
-        Dense(256, action_size)
+        Dense(256, action_size + 1)
     )
     act_log_std = Array{Float32}(undef, action_size)
     for i = eachindex(act_log_std)
         act_log_std[i] = -0.5
     end
-    act_optimiser = ADAM(3e-4)
-    act_params = params(actor, act_log_std)
-
-    # create the value network and optimiser
-    critic = Chain(
-        Dense(state_size, 256, relu),
-        Dense(256, 512, relu),
-        Dense(512, 512, relu),
-        Dense(512, 256, relu),
-        Dense(256, 1)
-    )
-    crt_optimiser = ADAM(3e-4)
-    crt_params = params(critic)
+    opt = ADAM(3e-4)
+    ac_params = params(actor_critic, act_log_std)
 
     # run n_epochs updates
     for i = 1:n_epochs
@@ -162,7 +171,7 @@ function train()
         while n < batch_size
 
             # run an episode
-            states, actions, log_probs, rewards, values = run_episode(actor, act_log_std, critic, max_steps)
+            states, actions, log_probs, rewards, values = run_episode(actor_critic, act_log_std, max_steps)
             sr += sum(rewards)
             ne += 1
 
@@ -196,20 +205,12 @@ function train()
         σ = std(adv_buf)
         adv_buf = (adv_buf .- μ) ./ σ
         
-        # update the policy network
+        # update the network
         for j = 1:n_p_updates
-            p_grad = gradient(() -> policy_loss(actor, act_log_std, states_buf, actions_buf, adv_buf, log_probs_buf, ϵ, c), act_params)
-            update!(act_optimiser, act_params, p_grad)
+            grad = gradient(() -> ac_loss(actor_critic, act_log_std, states_buf, actions_buf, adv_buf, log_probs_buf, ϵ, c, r2g_buf), ac_params)
+            update!(opt, ac_params, grad)
         end
-        println("time to update policy: ", now() - st)
-        st = now()
-
-        # update the value network
-        for j = 1:n_v_updates
-            v_grad = gradient(() -> value_loss(critic, states_buf, r2g_buf), crt_params)
-            update!(crt_optimiser, crt_params, v_grad)
-        end
-        println("time to update value function: ", now() - st)
+        println("time to update network: ", now() - st)
         println()
         
     end
