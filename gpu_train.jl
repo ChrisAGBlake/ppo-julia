@@ -28,7 +28,6 @@ function run_episode(actor, act_log_std, critic, max_steps)
     combined_actions = Array{Float32}(undef, action_size * 2)
     log_probs = Array{Float32}(undef, action_size, max_steps)
     rewards = Array{Float32}(undef, max_steps + 1)
-    values = Array{Float32}(undef, max_steps + 1)
     state = Array{Float32}(undef, state_size)
     norm_state = Array{Float32}(undef, state_size)
     row_buffer = Array{Float32}(undef, floor(Int, 2 / dt))
@@ -47,7 +46,6 @@ function run_episode(actor, act_log_std, critic, max_steps)
         action, log_prob = act(actor, act_log_std, norm_state)
         actions[:,i] = action[:]
         log_probs[:,i] = log_prob[:]
-        values[i] = critic(norm_state)[1]
 
         # get the opponents actions
         for j = eachindex(action)
@@ -68,7 +66,8 @@ function run_episode(actor, act_log_std, critic, max_steps)
             break
         end
     end
-
+    values = critic(view(states |> gpu, :, 1:n_steps+1))
+    values = values |> cpu
     # set the final value to 0
     values[n_steps + 1] = 0
     return view(states, :, 1:n_steps), view(actions, :, 1:n_steps), view(log_probs, :, 1:n_steps), view(rewards, 1:n_steps), view(values, 1:n_steps + 1)
@@ -145,9 +144,9 @@ function train()
         Dense(512, 512, relu),
         Dense(512, 256, relu),
         Dense(256, 1)
-    )
+    ) |> gpu
     crt_optimiser = ADAM(3e-4) |> gpu
-    # crt_params = params(critic)
+    crt_params = params(critic)
 
     # run n_epochs updates
     for i = 1:n_epochs
@@ -203,8 +202,6 @@ function train()
         actor = actor |> gpu
         act_log_std = act_log_std |> gpu
         act_params = params(actor, act_log_std)
-        critic = critic |> gpu
-        crt_params = params(critic)
         states_buf = states_buf |> gpu
         actions_buf = actions_buf |> gpu
         adv_buf = adv_buf |> gpu
@@ -230,7 +227,6 @@ function train()
         #shift to the cpu
         actor = actor |> cpu
         act_log_std = act_log_std |> cpu
-        critic = critic |> cpu
         states_buf = states_buf |> cpu
         actions_buf = actions_buf |> cpu
         adv_buf = adv_buf |> cpu

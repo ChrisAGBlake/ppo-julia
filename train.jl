@@ -27,7 +27,6 @@ function run_episode(actor, act_log_std, critic, max_steps)
     combined_actions = Array{Float32}(undef, action_size * 2)
     log_probs = Array{Float32}(undef, action_size, max_steps)
     rewards = Array{Float32}(undef, max_steps + 1)
-    values = Array{Float32}(undef, max_steps + 1)
     state = Array{Float32}(undef, state_size)
     norm_state = Array{Float32}(undef, state_size)
     row_buffer = Array{Float32}(undef, floor(Int, 2 / dt))
@@ -46,7 +45,6 @@ function run_episode(actor, act_log_std, critic, max_steps)
         action, log_prob = act(actor, act_log_std, norm_state)
         actions[:,i] = action[:]
         log_probs[:,i] = log_prob[:]
-        values[i] = critic(norm_state)[1]
 
         # get the opponents actions
         for j = eachindex(action)
@@ -67,7 +65,7 @@ function run_episode(actor, act_log_std, critic, max_steps)
             break
         end
     end
-
+    values = critic(view(states, :, 1:n_steps+1))
     # set the final value to 0
     values[n_steps + 1] = 0
     return view(states, :, 1:n_steps), view(actions, :, 1:n_steps), view(log_probs, :, 1:n_steps), view(rewards, 1:n_steps), view(values, 1:n_steps + 1)
