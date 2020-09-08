@@ -1,5 +1,5 @@
-include("./prestart_traj_env.jl")
-using .PrestartTrajectoryEnv
+include("./prestart_env.jl")
+using .PrestartEnv
 using Flux, Distributions
 using Flux: params, update!
 using Statistics: mean
@@ -24,12 +24,14 @@ end
 function run_episode(actor, act_log_std, critic, max_steps)
     states = Array{Float32}(undef, state_size, max_steps)
     actions = Array{Float32}(undef, action_size, max_steps)
+    combined_actions = Array{Float32}(undef, action_size * 2)
     log_probs = Array{Float32}(undef, action_size, max_steps)
     rewards = Array{Float32}(undef, max_steps + 1)
     values = Array{Float32}(undef, max_steps + 1)
     state = Array{Float32}(undef, state_size)
     norm_state = Array{Float32}(undef, state_size)
-    env_reset(state)
+    row_buffer = Array{Float32}(undef, floor(Int, 2 / dt))
+    env_reset(state, row_buffer)
     
     n_steps = max_steps
     for i = 1:max_steps
@@ -46,8 +48,15 @@ function run_episode(actor, act_log_std, critic, max_steps)
         log_probs[:,i] = log_prob[:]
         values[i] = critic(norm_state)[1]
 
+        # get the opponents actions
+        for j = eachindex(action)
+            combined_actions[j] = action[j]
+        end
+        combined_actions[3] = rand() * 2 - 1
+        combined_actions[4] = rand()
+
         # update the environment
-        reward, done = env_step(state, action)
+        reward, pnlt, won, done = env_step(state, combined_actions, row_buffer)
 
         # add reward to buffer
         rewards[i] = reward
@@ -101,23 +110,25 @@ function train()
     λ::Float32 = 0.97
     ϵ::Float32 = 0.2
     c::Float32 = log(sqrt(2 * π))
-    max_steps = 120
+    max_steps = floor(Int, 150 / dt)
     n_p_updates = 10
     n_v_updates = 10
-    batch_size = 2000
-    n_epochs = 1000
+    batch_size = 10000
+    n_epochs = 100
     gamma_arr = Array{Float32}(undef, max_steps)
     gamma_lam_arr = Array{Float32}(undef, max_steps)
     for i = eachindex(gamma_arr)
-        gamma_arr[i] = γ ^ (i-1)
-        gamma_lam_arr[i] = (γ * λ) ^ (i-1)
+        gamma_arr[i] = γ^(i-1)
+        gamma_lam_arr[i] = (γ * λ)^(i-1)
     end
 
     # create the policy network and optimiser
     actor = Chain(
-        Dense(state_size, 128, relu),
-        Dense(128, 128, relu),
-        Dense(128, 1)
+        Dense(state_size, 256, relu),
+        Dense(256, 512, relu),
+        Dense(512, 512, relu),
+        Dense(512, 256, relu),
+        Dense(256, action_size)
     )
     act_log_std = Array{Float32}(undef, action_size)
     for i = eachindex(act_log_std)
@@ -128,9 +139,11 @@ function train()
 
     # create the value network and optimiser
     critic = Chain(
-        Dense(state_size, 128, relu),
-        Dense(128, 128, relu),
-        Dense(128, 1)
+        Dense(state_size, 256, relu),
+        Dense(256, 512, relu),
+        Dense(512, 512, relu),
+        Dense(512, 256, relu),
+        Dense(256, 1)
     )
     crt_optimiser = ADAM(3e-4)
     crt_params = params(critic)
