@@ -68,7 +68,6 @@ function run_episode(actor, act_log_std, critic, max_steps)
     end
     values = critic(view(states |> gpu, :, 1:n_steps+1))
     values = values |> cpu
-    # set the final value to 0
     values[n_steps + 1] = 0
     return view(states, :, 1:n_steps), view(actions, :, 1:n_steps), view(log_probs, :, 1:n_steps), view(rewards, 1:n_steps), view(values, 1:n_steps + 1)
 end
@@ -135,7 +134,6 @@ function train()
         act_log_std[i] = -0.5
     end
     act_optimiser = ADAM(3e-4) |> gpu
-    # act_params = params(actor, act_log_std)
 
     # create the value network and optimiser
     critic = Chain(
@@ -173,7 +171,7 @@ function train()
 
             # calculate the advantage estimates
             sz = size(values)[1]
-            δ = view(rewards, 1:sz-1) + γ * view(values, 2:sz) - view(values, 1:sz-1)
+            δ = view(rewards, 1:sz-1) .+ γ .* view(values, 2:sz) .- view(values, 1:sz-1)
             adv_est = discount_cumsum(δ, gamma_lam_arr)
 
             # update the buffers
@@ -227,11 +225,6 @@ function train()
         #shift to the cpu
         actor = actor |> cpu
         act_log_std = act_log_std |> cpu
-        states_buf = states_buf |> cpu
-        actions_buf = actions_buf |> cpu
-        adv_buf = adv_buf |> cpu
-        log_probs_buf = log_probs_buf |> cpu
-        r2g_buf = r2g_buf |> cpu
         
     end
 end
