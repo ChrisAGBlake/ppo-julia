@@ -225,13 +225,6 @@ function train()
         # shift to the cpu
         actor = actor |> cpu
         act_log_std = act_log_std |> cpu
-
-        # free up memory on the gpu
-        states_buf = nothing
-        actions_buf = nothing
-        adv_buf = nothing
-        log_probs_buf = nothing
-        r2g_buf = nothing
         
     end
 end
