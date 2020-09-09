@@ -21,8 +21,8 @@ function act(actor, act_log_std, state)
     return action, log_prob
 end
 
-function run_episode(actor, act_log_std, critic, max_steps)
-    states = Array{Float32}(undef, state_size, max_steps)
+function run_episode(actor, act_log_std, critic)
+    states = Array{Float32}(undef, state_size, max_steps+1)
     actions = Array{Float32}(undef, action_size, max_steps)
     combined_actions = Array{Float32}(undef, action_size * 2)
     log_probs = Array{Float32}(undef, action_size, max_steps)
@@ -98,26 +98,16 @@ function value_loss(critic, states, rewards2go)
     return mean(loss)
 end
 
-function train()
+function train(hp)
 
     # initialise results file
     write("training_rewards.csv", "ave_episode_reward\n")
 
-    # set hyper parameters
-    γ::Float32 = 0.99
-    λ::Float32 = 0.97
-    ϵ::Float32 = 0.2
-    c::Float32 = log(sqrt(2 * π))
-    max_steps = floor(Int, 150 / dt)
-    n_p_updates = 10
-    n_v_updates = 10
-    batch_size = 10000
-    n_epochs = 100
     gamma_arr = Array{Float32}(undef, max_steps)
     gamma_lam_arr = Array{Float32}(undef, max_steps)
     for i = eachindex(gamma_arr)
-        gamma_arr[i] = γ^(i-1)
-        gamma_lam_arr[i] = (γ * λ)^(i-1)
+        gamma_arr[i] = hp.γ^(i-1)
+        gamma_lam_arr[i] = (hp.γ * hp.λ)^(i-1)
     end
 
     # create the policy network and optimiser
@@ -147,7 +137,7 @@ function train()
     crt_params = params(critic)
 
     # run n_epochs updates
-    for i = 1:n_epochs
+    for i = 1:hp.n_epochs
         st = now()
 
         # run a batch of episodes
@@ -159,10 +149,10 @@ function train()
         adv_buf = Array{Float32}(undef, 0)
         sr = 0.0
         ne = 0.0
-        while n < batch_size
+        while n < hp.batch_size
 
             # run an episode
-            states, actions, log_probs, rewards, values = run_episode(actor, act_log_std, critic, max_steps)
+            states, actions, log_probs, rewards, values = run_episode(actor, act_log_std, critic)
             sr += sum(rewards)
             ne += 1
 
@@ -171,7 +161,7 @@ function train()
 
             # calculate the advantage estimates
             sz = size(values)[1]
-            δ = view(rewards, 1:sz-1) + γ * view(values, 2:sz) - view(values, 1:sz-1)
+            δ = view(rewards, 1:sz-1) + hp.γ * view(values, 2:sz) - view(values, 1:sz-1)
             adv_est = discount_cumsum(δ, gamma_lam_arr)
 
             # update the buffers
@@ -197,15 +187,15 @@ function train()
         adv_buf = (adv_buf .- μ) ./ σ
         
         # update the policy network
-        for j = 1:n_p_updates
-            p_grad = gradient(() -> policy_loss(actor, act_log_std, states_buf, actions_buf, adv_buf, log_probs_buf, ϵ, c), act_params)
+        for j = 1:hp.n_p_updates
+            p_grad = gradient(() -> policy_loss(actor, act_log_std, states_buf, actions_buf, adv_buf, log_probs_buf, hp.ϵ, hp.c), act_params)
             update!(act_optimiser, act_params, p_grad)
         end
         println("time to update policy: ", now() - st)
         st = now()
 
         # update the value network
-        for j = 1:n_v_updates
+        for j = 1:hp.n_v_updates
             v_grad = gradient(() -> value_loss(critic, states_buf, r2g_buf), crt_params)
             update!(crt_optimiser, crt_params, v_grad)
         end
@@ -216,6 +206,21 @@ function train()
 end
 
 ini = now()
-train()
+
+# set the hyper parameters for the training
+struct hyper_parameters
+    γ::Float32
+    λ::Float32
+    ϵ::Float32
+    c::Float32
+    n_p_updates
+    n_v_updates
+    batch_size
+    n_epochs
+end
+hp = hyper_parameters(0.99, 0.97, 0.2, log(sqrt(2 * π)), 10, 10, 10000, 100)
+
+# run the training
+train(hp)
 println("total time: ", now() - ini)
 

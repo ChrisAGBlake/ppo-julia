@@ -1,5 +1,5 @@
 module PrestartEnv
-export env_step, env_reset, normalise, state_size, action_size, dt
+export env_step, env_reset, normalise, state_size, action_size, dt, max_steps
 using Random
 
 # acceleration coefficients
@@ -66,6 +66,7 @@ const collision_penalty = 0.05
 
 # timestep
 const dt = 1.0
+const max_steps = floor(Int32, (prestart_duration + max_t_after_start) / dt)
 
 # boat boundaries
 const virtual_boundary = [[0f0, 10f0, 0f0, -10f0] [0f0, -11f0, -23f0, -11f0]]
@@ -229,7 +230,7 @@ function calc_row(state)
                 end
             end
         end
-        if flag
+        if flag != 0
             # the intersection point is either aft of both bows or forward of both sterns
             # determine which boat is to windward at the intersection point
             # add a small amount to x opposite to the direction of travel and check which boat is further to windward at this x location
