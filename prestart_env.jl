@@ -176,7 +176,7 @@ function line_intersection_x(x1, y1, cwa1, x2, y2, cwa2)
 end
 
 function calc_row(state)
-    flag = false
+    flag = 0
 
     ################################################################
     # check if they are on different tacks
@@ -207,25 +207,25 @@ function calc_row(state)
         # is the intersection point aft of both bows
         if state[idx_b1cwa] > 0
             if x < state[idx_b1x] && x < state[idx_b2x]
-                flag = true
+                flag = 1
             end
         else
             if x > state[idx_b1x] && x > state[idx_b2x]
-                flag = true
+                flag = 1
             end
         end
 
         # is the intersection point forward of both sterns
-        if !flag
+        if flag == 0
             s1x = state[idx_b1x] + virtual_boundary[3,2] * sin(state[idx_b1cwa])
             s2x = state[idx_b2x] + virtual_boundary[3,2] * sin(state[idx_b2cwa])
             if state[idx_b1cwa] > 0
                 if x > s1x && x > s2x
-                    flag = true
+                    flag = -1
                 end
             else
                 if x < s1x && x < s2x
-                    flag = true
+                    flag = -1
                 end
             end
         end
@@ -234,9 +234,9 @@ function calc_row(state)
             # determine which boat is to windward at the intersection point
             # add a small amount to x opposite to the direction of travel and check which boat is further to windward at this x location
             if state[idx_b1cwa] > 0
-                x -= 1
+                x += flag
             else
-                x += 1
+                x -= flag
             end
             m = 1 / tan(state[idx_b1cwa])
             b1y = state[idx_b1y] + m * (x - state[idx_b1x])
