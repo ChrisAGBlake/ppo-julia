@@ -150,11 +150,11 @@ function train(hp)
 
         # run a batch of episodes
         n = 0
-        states_buf = Array{Float32}(undef, state_size, 0)
-        actions_buf = Array{Float32}(undef, action_size, 0)
-        log_probs_buf = Array{Float32}(undef, action_size, 0)
-        r2g_buf = Array{Float32}(undef, 0)
-        adv_buf = Array{Float32}(undef, 0)
+        states_buf = Array{Float32}(undef, state_size, hp.batch_size + max_steps)
+        actions_buf = Array{Float32}(undef, action_size, hp.batch_size + max_steps)
+        log_probs_buf = Array{Float32}(undef, action_size, hp.batch_size + max_steps)
+        r2g_buf = Array{Float32}(undef, hp.batch_size + max_steps)
+        adv_buf = Array{Float32}(undef, hp.batch_size + max_steps)
         sr = 0.0
         ne = 0.0
         while n < hp.batch_size
@@ -173,14 +173,21 @@ function train(hp)
             adv_est = discount_cumsum(δ, gamma_lam_arr)
 
             # update the buffers
-            states_buf = cat(states_buf, states, dims=2)
-            actions_buf = cat(actions_buf, actions, dims=2)
-            log_probs_buf = cat(log_probs_buf, log_probs, dims=2)
-            r2g_buf = cat(r2g_buf, r2g, dims=1)
-            adv_buf = cat(adv_buf, adv_est, dims=1)
-            n = size(states_buf)[end]
+            sz = size(states)[end]
+            states_buf[:,n+1:n+sz] = states[:,:]
+            actions_buf[:,n+1:n+sz] = actions[:,:]
+            log_probs_buf[:,n+1:n+sz] = log_probs[:,:]
+            r2g_buf[n+1:n+sz] = r2g[:]
+            adv_buf[n+1:n+sz] = adv_est[:]
+            n += sz
             
         end
+        states_buf = view(states_buf, :, 1:n)
+        actions_buf = view(actions_buf, :, 1:n)
+        log_probs_buf = view(log_probs_buf, :, 1:n)
+        r2g_buf = view(r2g_buf, 1:n)
+        adv_buf = view(adv_buf, 1:n)
+
         sr /= ne
         println("time to run episodes: ", now() - st)
         st = now()
