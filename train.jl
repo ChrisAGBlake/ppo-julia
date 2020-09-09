@@ -98,18 +98,7 @@ function value_loss(critic, states, rewards2go)
     return mean(loss)
 end
 
-function train(hp)
-
-    # initialise results file
-    write("training_rewards.csv", "ave_episode_reward\n")
-
-    gamma_arr = Array{Float32}(undef, max_steps)
-    gamma_lam_arr = Array{Float32}(undef, max_steps)
-    for i = eachindex(gamma_arr)
-        gamma_arr[i] = hp.γ^(i-1)
-        gamma_lam_arr[i] = (hp.γ * hp.λ)^(i-1)
-    end
-
+function setup_model()
     # create the policy network and optimiser
     actor = Chain(
         Dense(state_size, 256, relu),
@@ -135,6 +124,25 @@ function train(hp)
     )
     crt_optimiser = ADAM(3e-4)
     crt_params = params(critic)
+
+    return actor, act_log_std, act_params, act_optimiser, critic, crt_params, crt_optimiser
+end
+
+function train(hp)
+
+    # initialise results file
+    write("training_rewards.csv", "ave_episode_reward\n")
+
+    # setup arrays to speed up calculation of advantage estimates
+    gamma_arr = Array{Float32}(undef, max_steps)
+    gamma_lam_arr = Array{Float32}(undef, max_steps)
+    for i = eachindex(gamma_arr)
+        gamma_arr[i] = hp.γ^(i-1)
+        gamma_lam_arr[i] = (hp.γ * hp.λ)^(i-1)
+    end
+
+    # create the actor critic model
+    actor, act_log_std, act_params, act_optimiser, critic, crt_params, crt_optimiser = setup_model()
 
     # run n_epochs updates
     for i = 1:hp.n_epochs
