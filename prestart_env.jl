@@ -1,5 +1,5 @@
 module PrestartEnv
-export env_step, env_reset, normalise, state_size, action_size, dt, max_steps
+export env_step, env_reset, normalise, get_opponent_state, state_size, action_size, dt, max_steps
 using Random
 
 # acceleration coefficients
@@ -806,6 +806,16 @@ function normalise(state)
     state[idx_stb_x] /= 1000
     state[idx_stb_y] /= 1000
     return
+end
+
+function get_opponent_state(state)
+    o_state = copy(state)
+    o_state[1:n_boat_states] = state[n_boat_states+1:n_boat_states*2]
+    o_state[n_boat_states+1:n_boat_states*2] = state[1:n_boat_states]
+    o_state[idx_row] *= -1
+    o_state[idx_row_1] *= -1
+    o_state[idx_row_2] *= -1
+    return o_state
 end
 
 end

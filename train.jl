@@ -49,11 +49,14 @@ function run_episode(actor, act_log_std, critic, opponent, use_gpu::Bool)
         log_probs[:,i] = log_prob[:]
 
         # get the opponents actions
-        for j = eachindex(action)
-            combined_actions[j] = action[j]
-        end
-        combined_actions[3] = rand() * 2 - 1
-        combined_actions[4] = rand()
+        opponent_state = get_opponent_state(norm_state)
+        opponent_action = opponent(opponent_state)
+
+        # create the combined actions
+        combined_actions[1] = action[1]
+        combined_actions[2] = action[2]
+        combined_actions[3] = opponent_action[1]
+        combined_actions[4] = opponent_action[2]
 
         # update the environment
         reward, pnlt, won, done = env_step(state, combined_actions, row_buffer)
@@ -176,6 +179,7 @@ function get_checkpoint_idx()
             if n > idx
                 idx = n
             end
+        end
     end
     return idx
 end
@@ -199,9 +203,10 @@ function choose_opponent()
     r = floor(Int32, rand() * j + 1)
     
     # load the opponent
-    @load checkpoint_names[r] opponent
+    println("loading ", checkpoint_names[r])
+    @load string("checkpoints/", checkpoint_names[r]) actor
 
-    return opponent
+    return actor
 end
 
 function train(hp, use_gpu::Bool)
