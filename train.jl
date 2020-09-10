@@ -4,6 +4,7 @@ using Flux, Distributions
 using Flux: params, update!
 using Statistics: mean
 using Dates: now
+using CUDA
 
 function act(actor, act_log_std, state)
     σ = exp.(act_log_std)
@@ -21,7 +22,7 @@ function act(actor, act_log_std, state)
     return action, log_prob
 end
 
-function run_episode(actor, act_log_std, critic)
+function run_episode(actor, act_log_std, critic, use_gpu::Bool)
     states = Array{Float32}(undef, state_size, max_steps+1)
     actions = Array{Float32}(undef, action_size, max_steps)
     combined_actions = Array{Float32}(undef, action_size * 2)
@@ -65,7 +66,12 @@ function run_episode(actor, act_log_std, critic)
             break
         end
     end
-    values = critic(view(states, :, 1:n_steps+1))
+    if use_gpu
+        values = critic(view(states |> gpu, :, 1:n_steps+1))
+        values = values |> cpu
+    else
+        values = critic(view(states, :, 1:n_steps+1))
+    end
     # set the final value to 0
     values[n_steps + 1] = 0
     return view(states, :, 1:n_steps), view(actions, :, 1:n_steps), view(log_probs, :, 1:n_steps), view(rewards, 1:n_steps), view(values, 1:n_steps + 1)
@@ -98,7 +104,7 @@ function value_loss(critic, states, rewards2go)
     return mean(loss)
 end
 
-function setup_model()
+function setup_model(lr, use_gpu::Bool)
     # create the policy network and optimiser
     actor = Chain(
         Dense(state_size, 256, relu),
@@ -111,8 +117,10 @@ function setup_model()
     for i = eachindex(act_log_std)
         act_log_std[i] = -0.5
     end
-    act_optimiser = ADAM(3e-4)
-    act_params = params(actor, act_log_std)
+    act_optimiser = ADAM(lr)
+    if use_gpu
+        act_optimiser = act_optimiser |> gpu
+    end
 
     # create the value network and optimiser
     critic = Chain(
@@ -122,13 +130,16 @@ function setup_model()
         Dense(512, 256, relu),
         Dense(256, 1)
     )
-    crt_optimiser = ADAM(3e-4)
-    crt_params = params(critic)
+    crt_optimiser = ADAM(lr)
+    if use_gpu
+        critic = critic |> gpu
+        act_optimiser = act_optimiser |> gpu
+    end
 
-    return actor, act_log_std, act_params, act_optimiser, critic, crt_params, crt_optimiser
+    return actor, act_log_std, act_optimiser, critic, crt_optimiser
 end
 
-function train(hp)
+function train(hp, use_gpu::Bool)
 
     # initialise results file
     write("training_rewards.csv", "ave_episode_reward\n")
@@ -142,7 +153,7 @@ function train(hp)
     end
 
     # create the actor critic model
-    actor, act_log_std, act_params, act_optimiser, critic, crt_params, crt_optimiser = setup_model()
+    actor, act_log_std, act_optimiser, critic, crt_optimiser = setup_model(hp.lr, use_gpu)
 
     # run n_epochs updates
     for i = 1:hp.n_epochs
@@ -150,17 +161,17 @@ function train(hp)
 
         # run a batch of episodes
         n = 0
-        states_buf = Array{Float32}(undef, state_size, hp.batch_size + max_steps)
-        actions_buf = Array{Float32}(undef, action_size, hp.batch_size + max_steps)
-        log_probs_buf = Array{Float32}(undef, action_size, hp.batch_size + max_steps)
-        r2g_buf = Array{Float32}(undef, hp.batch_size + max_steps)
-        adv_buf = Array{Float32}(undef, hp.batch_size + max_steps)
+        states_buf = Array{Float32}(undef, state_size, 0)
+        actions_buf = Array{Float32}(undef, action_size, 0)
+        log_probs_buf = Array{Float32}(undef, action_size, 0)
+        r2g_buf = Array{Float32}(undef, 0)
+        adv_buf = Array{Float32}(undef, 0)
         sr = 0.0
         ne = 0.0
         while n < hp.batch_size
 
             # run an episode
-            states, actions, log_probs, rewards, values = run_episode(actor, act_log_std, critic)
+            states, actions, log_probs, rewards, values = run_episode(actor, act_log_std, critic, use_gpu)
             sr += sum(rewards)
             ne += 1
 
@@ -173,20 +184,14 @@ function train(hp)
             adv_est = discount_cumsum(δ, gamma_lam_arr)
 
             # update the buffers
-            sz = size(states)[end]
-            states_buf[:,n+1:n+sz] = states[:,:]
-            actions_buf[:,n+1:n+sz] = actions[:,:]
-            log_probs_buf[:,n+1:n+sz] = log_probs[:,:]
-            r2g_buf[n+1:n+sz] = r2g[:]
-            adv_buf[n+1:n+sz] = adv_est[:]
-            n += sz
+            states_buf = cat(states_buf, states, dims=2)
+            actions_buf = cat(actions_buf, actions, dims=2)
+            log_probs_buf = cat(log_probs_buf, log_probs, dims=2)
+            r2g_buf = cat(r2g_buf, r2g, dims=1)
+            adv_buf = cat(adv_buf, adv_est, dims=1)
+            n = size(states_buf)[end]
             
         end
-        states_buf = view(states_buf, :, 1:n)
-        actions_buf = view(actions_buf, :, 1:n)
-        log_probs_buf = view(log_probs_buf, :, 1:n)
-        r2g_buf = view(r2g_buf, 1:n)
-        adv_buf = view(adv_buf, 1:n)
 
         sr /= ne
         println("time to run episodes: ", now() - st)
@@ -200,8 +205,21 @@ function train(hp)
         μ = mean(adv_buf)
         σ = std(adv_buf)
         adv_buf = (adv_buf .- μ) ./ σ
+
+        #shift to the gpu
+        if use_gpu
+            actor = actor |> gpu
+            act_log_std = act_log_std |> gpu
+            states_buf = states_buf |> gpu
+            actions_buf = actions_buf |> gpu
+            adv_buf = adv_buf |> gpu
+            log_probs_buf = log_probs_buf |> gpu
+            r2g_buf = r2g_buf |> gpu
+        end
         
         # update the policy network
+        act_params = params(actor, act_log_std)
+        
         for j = 1:hp.n_p_updates
             p_grad = gradient(() -> policy_loss(actor, act_log_std, states_buf, actions_buf, adv_buf, log_probs_buf, hp.ϵ, hp.c), act_params)
             update!(act_optimiser, act_params, p_grad)
@@ -210,12 +228,19 @@ function train(hp)
         st = now()
 
         # update the value network
+        crt_params = params(critic)
         for j = 1:hp.n_v_updates
             v_grad = gradient(() -> value_loss(critic, states_buf, r2g_buf), crt_params)
             update!(crt_optimiser, crt_params, v_grad)
         end
         println("time to update value function: ", now() - st)
         println()
+
+        # shift back to the cpu
+        if use_gpu
+            actor = actor |> cpu
+            act_log_std = act_log_std |> cpu
+        end
         
     end
 end
@@ -228,14 +253,15 @@ struct hyper_parameters
     λ::Float32
     ϵ::Float32
     c::Float32
+    lr::Float32
     n_p_updates
     n_v_updates
     batch_size
     n_epochs
 end
-hp = hyper_parameters(0.99, 0.97, 0.2, log(sqrt(2 * π)), 10, 10, 10000, 100)
+hp = hyper_parameters(0.99, 0.97, 0.2, log(sqrt(2 * π)), 3e-4, 10, 10, 10000, 100)
 
 # run the training
-train(hp)
+train(hp, false)
 println("total time: ", now() - ini)
 
