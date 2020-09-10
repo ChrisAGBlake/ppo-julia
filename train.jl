@@ -171,40 +171,33 @@ function get_checkpoint_idx()
 
     # get the highest index of the checkpoints
     idx = 1
-    checkpoint_names = Array{String}(undef, size(checkpoints)[1])
     for i = eachindex(checkpoints)
-        m = match(r"actor", checkpoints[i])
-        if m != nothing
-            n = parse(Int, match(r"\d+", checkpoints[i]).match)
-            if n > idx
-                idx = n
-            end
+        n = parse(Int, match(r"\d+", checkpoints[i]).match)
+        if n > idx
+            idx = n
         end
     end
     return idx
 end
 
-function choose_opponent()
+function choose_opponent(use_gpu::Bool)
 
     # get the potential opponents
     checkpoints = readdir("checkpoints/")
-    j = 1
-    checkpoint_names = Array{String}(undef, size(checkpoints)[1])
-    for i = eachindex(checkpoints)
-        m = match(r"actor", checkpoints[i])
-        if m != nothing
-            checkpoint_names[j] = checkpoints[i]
-            j += 1
-        end
-    end
-    j -= 1
+    sz = size(checkpoints)[1]
 
-    # select an opponent
-    r = floor(Int32, rand() * j + 1)
-    
-    # load the opponent
-    println("loading ", checkpoint_names[r])
-    @load string("checkpoints/", checkpoint_names[r]) actor
+    if sz > 0
+        # select an opponent
+        r = floor(Int32, rand() * sz + 1)
+        
+        # load the opponent
+        println("loading ", checkpoints[r])
+        @load string("checkpoints/", checkpoints[r]) actor act_log_std critic
+    else
+        # no models present yet, create one at random
+        println("no checkpoints available, creating opponent from scratch")
+        actor, act_log_std, act_optimiser, critic, crt_optimiser = setup_model(0.001, use_gpu)
+    end
 
     return actor
 end
@@ -242,7 +235,7 @@ function train(hp, use_gpu::Bool)
             ne = 0.0
 
             # select an opponent
-            opponent = choose_opponent()
+            opponent = choose_opponent(use_gpu)
 
             # run a batch of episodes
             while n < hp.batch_size
@@ -305,9 +298,7 @@ function train(hp, use_gpu::Bool)
         end
 
         # checkpoint the model
-        @save string("checkpoints/actor_", idx, ".bson") actor
-        @save string("checkpoints/act_log_std_", idx, ".bson") act_log_std
-        @save string("checkpoints/critic_", idx, ".bson") critic
+        @save string("checkpoints/model_", idx, ".bson") actor act_log_std critic
         idx += 1
     end
 end
