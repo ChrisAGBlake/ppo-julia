@@ -5,7 +5,7 @@ using Flux: params, update!
 using Statistics: mean
 using Dates: now
 using CUDA
-using BSON: @save
+using BSON: @save, @load
 
 function act(actor, act_log_std, state)
     σ = exp.(act_log_std)
@@ -23,7 +23,7 @@ function act(actor, act_log_std, state)
     return action, log_prob
 end
 
-function run_episode(actor, act_log_std, critic, use_gpu::Bool)
+function run_episode(actor, act_log_std, critic, opponent, use_gpu::Bool)
     states = Array{Float32}(undef, state_size, max_steps+1)
     actions = Array{Float32}(undef, action_size, max_steps)
     combined_actions = Array{Float32}(undef, action_size * 2)
@@ -162,6 +162,48 @@ function update_ac(actor, act_log_std, act_optimiser, critic, crt_optimiser, sta
     return
 end
 
+function get_checkpoint_idx()
+    # get the array of checkpoints
+    checkpoints = readdir("checkpoints/")
+
+    # get the highest index of the checkpoints
+    idx = 1
+    checkpoint_names = Array{String}(undef, size(checkpoints)[1])
+    for i = eachindex(checkpoints)
+        m = match(r"actor", checkpoints[i])
+        if m != nothing
+            n = parse(Int, match(r"\d+", checkpoints[i]).match)
+            if n > idx
+                idx = n
+            end
+    end
+    return idx
+end
+
+function choose_opponent()
+
+    # get the potential opponents
+    checkpoints = readdir("checkpoints/")
+    j = 1
+    checkpoint_names = Array{String}(undef, size(checkpoints)[1])
+    for i = eachindex(checkpoints)
+        m = match(r"actor", checkpoints[i])
+        if m != nothing
+            checkpoint_names[j] = checkpoints[i]
+            j += 1
+        end
+    end
+    j -= 1
+
+    # select an opponent
+    r = floor(Int32, rand() * j + 1)
+    
+    # load the opponent
+    @load checkpoint_names[r] opponent
+
+    return opponent
+end
+
 function train(hp, use_gpu::Bool)
 
     # initialise results file
@@ -184,7 +226,7 @@ function train(hp, use_gpu::Bool)
         for i = 1:hp.n_epochs
             st = now()
 
-            # run a batch of episodes
+            # setup data buffers
             n = 0
             states_buf = Array{Float32}(undef, state_size, 0)
             actions_buf = Array{Float32}(undef, action_size, 0)
@@ -193,10 +235,15 @@ function train(hp, use_gpu::Bool)
             adv_buf = Array{Float32}(undef, 0)
             sr = 0.0
             ne = 0.0
+
+            # select an opponent
+            opponent = choose_opponent()
+
+            # run a batch of episodes
             while n < hp.batch_size
 
                 # run an episode
-                states, actions, log_probs, rewards, values = run_episode(actor, act_log_std, critic, use_gpu)
+                states, actions, log_probs, rewards, values = run_episode(actor, act_log_std, critic, opponent, use_gpu)
                 sr += sum(rewards)
                 ne += 1
 
