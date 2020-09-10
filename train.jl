@@ -5,6 +5,7 @@ using Flux: params, update!
 using Statistics: mean
 using Dates: now
 using CUDA
+using BSON: @save
 
 function act(actor, act_log_std, state)
     σ = exp.(act_log_std)
@@ -177,80 +178,87 @@ function train(hp, use_gpu::Bool)
     # create the actor critic model
     actor, act_log_std, act_optimiser, critic, crt_optimiser = setup_model(hp.lr, use_gpu)
 
-    # run n_epochs updates
-    for i = 1:hp.n_epochs
-        st = now()
+    idx = 1
+    while true
+        # run n_epochs updates
+        for i = 1:hp.n_epochs
+            st = now()
 
-        # run a batch of episodes
-        n = 0
-        states_buf = Array{Float32}(undef, state_size, 0)
-        actions_buf = Array{Float32}(undef, action_size, 0)
-        log_probs_buf = Array{Float32}(undef, action_size, 0)
-        r2g_buf = Array{Float32}(undef, 0)
-        adv_buf = Array{Float32}(undef, 0)
-        sr = 0.0
-        ne = 0.0
-        while n < hp.batch_size
+            # run a batch of episodes
+            n = 0
+            states_buf = Array{Float32}(undef, state_size, 0)
+            actions_buf = Array{Float32}(undef, action_size, 0)
+            log_probs_buf = Array{Float32}(undef, action_size, 0)
+            r2g_buf = Array{Float32}(undef, 0)
+            adv_buf = Array{Float32}(undef, 0)
+            sr = 0.0
+            ne = 0.0
+            while n < hp.batch_size
 
-            # run an episode
-            states, actions, log_probs, rewards, values = run_episode(actor, act_log_std, critic, use_gpu)
-            sr += sum(rewards)
-            ne += 1
+                # run an episode
+                states, actions, log_probs, rewards, values = run_episode(actor, act_log_std, critic, use_gpu)
+                sr += sum(rewards)
+                ne += 1
 
-            # calculate the rewards to go
-            r2g = discount_cumsum(rewards, gamma_arr)
+                # calculate the rewards to go
+                r2g = discount_cumsum(rewards, gamma_arr)
 
-            # calculate the advantage estimates
-            sz = size(values)[1]
-            δ = view(rewards, 1:sz-1) + hp.γ * view(values, 2:sz) - view(values, 1:sz-1)
-            adv_est = discount_cumsum(δ, gamma_lam_arr)
+                # calculate the advantage estimates
+                sz = size(values)[1]
+                δ = view(rewards, 1:sz-1) + hp.γ * view(values, 2:sz) - view(values, 1:sz-1)
+                adv_est = discount_cumsum(δ, gamma_lam_arr)
 
-            # update the buffers
-            states_buf = cat(states_buf, states, dims=2)
-            actions_buf = cat(actions_buf, actions, dims=2)
-            log_probs_buf = cat(log_probs_buf, log_probs, dims=2)
-            r2g_buf = cat(r2g_buf, r2g, dims=1)
-            adv_buf = cat(adv_buf, adv_est, dims=1)
-            n = size(states_buf)[end]
+                # update the buffers
+                states_buf = cat(states_buf, states, dims=2)
+                actions_buf = cat(actions_buf, actions, dims=2)
+                log_probs_buf = cat(log_probs_buf, log_probs, dims=2)
+                r2g_buf = cat(r2g_buf, r2g, dims=1)
+                adv_buf = cat(adv_buf, adv_est, dims=1)
+                n = size(states_buf)[end]
+                
+            end
+
+            sr /= ne
+            println("time to run episodes: ", now() - st)
+            println(i, ", ave rewards per episode: ", sr)
+            open("training_rewards.csv", "a") do io
+                write(io, string(sr, "\n"))
+            end
+
+            # normalise the advantage estimates
+            μ = mean(adv_buf)
+            σ = std(adv_buf)
+            adv_buf = (adv_buf .- μ) ./ σ
+
+            #shift to the gpu
+            if use_gpu
+                actor = actor |> gpu
+                act_log_std = act_log_std |> gpu
+                states_buf = states_buf |> gpu
+                actions_buf = actions_buf |> gpu
+                adv_buf = adv_buf |> gpu
+                log_probs_buf = log_probs_buf |> gpu
+                r2g_buf = r2g_buf |> gpu
+            end
+            
+            # update the actor critic networks
+            update_ac(actor, act_log_std, act_optimiser, critic, crt_optimiser, states_buf, actions_buf, adv_buf, log_probs_buf, r2g_buf, hp)
+
+            # shift back to the cpu
+            if use_gpu
+                actor = actor |> cpu
+                act_log_std = act_log_std |> cpu
+            end
             
         end
 
-        sr /= ne
-        println("time to run episodes: ", now() - st)
-        println(i, ", ave rewards per episode: ", sr)
-        open("training_rewards.csv", "a") do io
-            write(io, string(sr, "\n"))
-        end
-
-        # normalise the advantage estimates
-        μ = mean(adv_buf)
-        σ = std(adv_buf)
-        adv_buf = (adv_buf .- μ) ./ σ
-
-        #shift to the gpu
-        if use_gpu
-            actor = actor |> gpu
-            act_log_std = act_log_std |> gpu
-            states_buf = states_buf |> gpu
-            actions_buf = actions_buf |> gpu
-            adv_buf = adv_buf |> gpu
-            log_probs_buf = log_probs_buf |> gpu
-            r2g_buf = r2g_buf |> gpu
-        end
-        
-        # update the actor critic networks
-        update_ac(actor, act_log_std, act_optimiser, critic, crt_optimiser, states_buf, actions_buf, adv_buf, log_probs_buf, r2g_buf, hp)
-
-        # shift back to the cpu
-        if use_gpu
-            actor = actor |> cpu
-            act_log_std = act_log_std |> cpu
-        end
-        
+        # checkpoint the model
+        @save string("checkpoints/actor_", idx, ".bson") actor
+        @save string("checkpoints/act_log_std_", idx, ".bson") act_log_std
+        @save string("checkpoints/critic_", idx, ".bson") critic
+        idx += 1
     end
 end
-
-ini = now()
 
 # set the hyper parameters for the training
 struct hyper_parameters
@@ -264,9 +272,9 @@ struct hyper_parameters
     batch_size
     n_epochs
 end
-hp = hyper_parameters(0.99, 0.97, 0.2, log(sqrt(2 * π)), 3e-4, 10, 10, 10000, 100)
+hp = hyper_parameters(0.99, 0.97, 0.2, log(sqrt(2 * π)), 3e-4, 10, 10, 10000, 10)
 
 # run the training
+st = now()
 train(hp, true)
-println("total time: ", now() - ini)
-
+println("total time: ", now() - st)
