@@ -139,6 +139,28 @@ function setup_model(lr, use_gpu::Bool)
     return actor, act_log_std, act_optimiser, critic, crt_optimiser
 end
 
+function update_ac(actor, act_log_std, act_optimiser, critic, crt_optimiser, states, actions, adv, log_probs, r2g, hp)
+    # update the policy network
+    st = now()
+    act_params = params(actor, act_log_std)
+    for j = 1:hp.n_p_updates
+        p_grad = gradient(() -> policy_loss(actor, act_log_std, states, actions, adv, log_probs, hp.ϵ, hp.c), act_params)
+        update!(act_optimiser, act_params, p_grad)
+    end
+    println("time to update policy: ", now() - st)
+    
+    # update the value network
+    st = now()
+    crt_params = params(critic)
+    for j = 1:hp.n_v_updates
+        v_grad = gradient(() -> value_loss(critic, states, r2g), crt_params)
+        update!(crt_optimiser, crt_params, v_grad)
+    end
+    println("time to update value function: ", now() - st)
+    println()
+    return
+end
+
 function train(hp, use_gpu::Bool)
 
     # initialise results file
@@ -195,7 +217,6 @@ function train(hp, use_gpu::Bool)
 
         sr /= ne
         println("time to run episodes: ", now() - st)
-        st = now()
         println(i, ", ave rewards per episode: ", sr)
         open("training_rewards.csv", "a") do io
             write(io, string(sr, "\n"))
@@ -217,24 +238,8 @@ function train(hp, use_gpu::Bool)
             r2g_buf = r2g_buf |> gpu
         end
         
-        # update the policy network
-        act_params = params(actor, act_log_std)
-        
-        for j = 1:hp.n_p_updates
-            p_grad = gradient(() -> policy_loss(actor, act_log_std, states_buf, actions_buf, adv_buf, log_probs_buf, hp.ϵ, hp.c), act_params)
-            update!(act_optimiser, act_params, p_grad)
-        end
-        println("time to update policy: ", now() - st)
-        st = now()
-
-        # update the value network
-        crt_params = params(critic)
-        for j = 1:hp.n_v_updates
-            v_grad = gradient(() -> value_loss(critic, states_buf, r2g_buf), crt_params)
-            update!(crt_optimiser, crt_params, v_grad)
-        end
-        println("time to update value function: ", now() - st)
-        println()
+        # update the actor critic networks
+        update_ac(actor, act_log_std, act_optimiser, critic, crt_optimiser, states_buf, actions_buf, adv_buf, log_probs_buf, r2g_buf, hp)
 
         # shift back to the cpu
         if use_gpu
@@ -262,6 +267,6 @@ end
 hp = hyper_parameters(0.99, 0.97, 0.2, log(sqrt(2 * π)), 3e-4, 10, 10, 10000, 100)
 
 # run the training
-train(hp, false)
+train(hp, true)
 println("total time: ", now() - ini)
 
