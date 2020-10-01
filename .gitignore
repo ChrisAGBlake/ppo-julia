@@ -1,4 +1,5 @@
 *.csv
 .ipynb_checkpoints
 *.ipynb
-checkpoints
+models
+.vscode

@@ -1,15 +1,19 @@
-include("./prestart_env.jl")
+include("prestart_env.jl")
+include("utils.jl")
 using .PrestartEnv
-using Flux, Distributions
-using Flux: params, update!
-using Statistics: mean
+using .Utils
+using Flux
+using Statistics: mean, sum
 using Dates: now
+using Distributions
 using CUDA
 using BSON: @save, @load
 
-function act(actor, act_log_std, state)
-    σ = exp.(act_log_std)
-    μ = actor(state)
+function act(model, log_std, state, c)
+    σ = exp.(log_std)
+    μ = model(state)
+    value = μ[end]
+    μ = view(μ, 1:action_size)
 
     # sample an action from a normal distribution with mean μ and standard deviation σ
     d = Normal.(μ, σ)
@@ -17,49 +21,54 @@ function act(actor, act_log_std, state)
 
     # calculate the log probability of this action
     v = σ.^2
-    log_scale = log.(σ)
-    log_prob = -((action .- μ).^2) ./ (2 .* v) .- log_scale .- log(sqrt(2 * π))
+    log_prob = sum(-((action .- μ).^2) ./ (2 .* v) .- log_std .- c)
 
-    return action, log_prob
+    return action, log_prob, value
 end
 
-function run_episode(actor, act_log_std, critic, opponent, use_gpu::Bool)
-    states = Array{Float32}(undef, state_size, max_steps+1)
-    actions = Array{Float32}(undef, action_size, max_steps)
-    combined_actions = Array{Float32}(undef, action_size * 2)
-    log_probs = Array{Float32}(undef, action_size, max_steps)
-    rewards = Array{Float32}(undef, max_steps + 1)
-    state = Array{Float32}(undef, state_size)
-    norm_state = Array{Float32}(undef, state_size)
-    row_buffer = Array{Float32}(undef, floor(Int, 2 / dt))
-    env_reset(state, row_buffer)
+function run_episode(model, log_std, opponent, polar, states, actions, values, combined_actions, log_probs, rewards, state, norm_state, opp_state, row_buffer, init_states, init_idx, c)
     
+    env_reset(state, row_buffer, polar, init_states, init_idx)
     n_steps = max_steps
     for i = 1:max_steps
         # get the normalised state
-        norm_state[:] = state[:]
+        norm_state[:] = state
         normalise(norm_state)
 
         # add state to buffer
-        states[:,i] = norm_state[:]
+        states[:,i] = norm_state
 
         # get action, log prob of action and value estimate
-        action, log_prob = act(actor, act_log_std, norm_state)
-        actions[:,i] = action[:]
-        log_probs[:,i] = log_prob[:]
+        action, log_prob, value = act(model, log_std, norm_state, c)
+        actions[:,i] = action
+        values[i] = value
+        log_probs[i] = log_prob
+        combined_actions[1:2] = action
 
         # get the opponents actions
-        opponent_state = get_opponent_state(norm_state)
-        opponent_action = opponent(opponent_state)
-
-        # create the combined actions
-        combined_actions[1] = action[1]
-        combined_actions[2] = action[2]
-        combined_actions[3] = opponent_action[1]
-        combined_actions[4] = opponent_action[2]
+        if opponent === nothing
+            combined_actions[3] = rand() * 2 - 1
+            combined_actions[4] = rand()
+        else
+            get_opponent_state(norm_state, opp_state)
+            opponent_action = opponent(opp_state)
+            combined_actions[3:4] = view(opponent_action, 1:action_size)
+        end
 
         # update the environment
-        reward, pnlt, won, done = env_step(state, combined_actions, row_buffer)
+        reward, pnlt, won, done = env_step(state, combined_actions, row_buffer, polar, false)
+
+        # if there has been a penalty, add the state 10s before to the init_states array
+        if pnlt && i > 10 / dt
+            n = floor(Int, i - 10 / dt)
+            init_idx += 1
+            init_states[:, init_idx] = view(states, :, n)
+            denormalise(view(init_states, :, init_idx))
+            if init_idx == 10000
+                init_states[:,1:1000] = view(init_states, :,9001:10000)
+                init_idx = 1000
+            end
+        end
 
         # add reward to buffer
         rewards[i] = reward
@@ -70,15 +79,12 @@ function run_episode(actor, act_log_std, critic, opponent, use_gpu::Bool)
             break
         end
     end
-    if use_gpu
-        values = critic(view(states |> gpu, :, 1:n_steps+1))
-        values = values |> cpu
-    else
-        values = critic(view(states, :, 1:n_steps+1))
-    end
+    
     # set the final value to 0
-    values[n_steps + 1] = 0
-    return view(states, :, 1:n_steps), view(actions, :, 1:n_steps), view(log_probs, :, 1:n_steps), view(rewards, 1:n_steps), view(values, 1:n_steps + 1)
+    n_steps += 1
+    values[n_steps] = 0
+
+    return n_steps, init_idx
 end
 
 function discount_cumsum(values, discount_array)
@@ -90,100 +96,136 @@ function discount_cumsum(values, discount_array)
     return res
 end
 
-function policy_loss(actor, act_log_std, states, actions, adv_est, log_prob_old, ϵ, c)
-    μ = actor(states)
-    σ = exp.(act_log_std)  
-    v = σ.^2
-    log_scale = log.(σ)
-    log_prob = -((actions .- μ).^2) ./ (2 .* v) .- log_scale .- c
-    ratio = exp.(log_prob .- log_prob_old)
-    clip_adv = clamp.(ratio, 1-ϵ, 1+ϵ) .* adv_est'
-    loss = -mean(min.(ratio .* adv_est', clip_adv))
-    return loss
-end
-
-function value_loss(critic, states, rewards2go)
-    values = critic(states)
-    loss = (values' .- rewards2go) .^ 2
-    return mean(loss)
-end
-
-function setup_model(lr, use_gpu::Bool)
-    # create the policy network and optimiser
-    actor = Chain(
-        Dense(state_size, 256, relu),
-        Dense(256, 512, relu),
-        Dense(512, 512, relu),
-        Dense(512, 256, relu),
-        Dense(256, action_size)
-    )
-    act_log_std = Array{Float32}(undef, action_size)
-    for i = eachindex(act_log_std)
-        act_log_std[i] = -0.5
-    end
-    act_optimiser = ADAM(lr)
-    if use_gpu
-        act_optimiser = act_optimiser |> gpu
-    end
-
-    # create the value network and optimiser
-    critic = Chain(
-        Dense(state_size, 256, relu),
-        Dense(256, 512, relu),
-        Dense(512, 512, relu),
-        Dense(512, 256, relu),
-        Dense(256, 1)
-    )
-    crt_optimiser = ADAM(lr)
-    if use_gpu
-        critic = critic |> gpu
-        act_optimiser = act_optimiser |> gpu
-    end
-
-    return actor, act_log_std, act_optimiser, critic, crt_optimiser
-end
-
-function update_ac(actor, act_log_std, act_optimiser, critic, crt_optimiser, states, actions, adv, log_probs, r2g, hp)
-    # update the policy network
-    st = now()
-    act_params = params(actor, act_log_std)
-    for j = 1:hp.n_p_updates
-        p_grad = gradient(() -> policy_loss(actor, act_log_std, states, actions, adv, log_probs, hp.ϵ, hp.c), act_params)
-        update!(act_optimiser, act_params, p_grad)
-    end
-    println("time to update policy: ", now() - st)
+function loss(model, log_std, states, actions, adv_est, log_prob_old, rewards2go, values_old, hp)
     
-    # update the value network
-    st = now()
-    crt_params = params(critic)
-    for j = 1:hp.n_v_updates
-        v_grad = gradient(() -> value_loss(critic, states, r2g), crt_params)
-        update!(crt_optimiser, crt_params, v_grad)
+    # get model action and value predictions from the states
+    μ = model(states)
+    values = view(μ, action_size+1, :)
+    μ = view(μ, 1:action_size, :)
+
+    # calculate policy loss
+    σ = exp.(log_std)  
+    v = σ.^2
+    log_prob = view(sum(-((actions .- μ).^2) ./ (2 .* v) .- log_std .- hp.c, dims=1), 1, :)
+    ratio = exp.(log_prob .- log_prob_old)
+    clip_adv = clamp.(ratio, 1-hp.ϵ, 1+hp.ϵ) .* adv_est
+    p_loss = -mean(min.(ratio .* adv_est, clip_adv))
+
+    # calculate entropy
+    entropy = sum(log_std .+ hp.d)
+    entropy *= hp.ent_coef
+
+    # calculate clipped value loss
+    v_clip = values_old .+ clamp.(values .- values_old, -hp.ϵ, hp.ϵ)
+    v_loss1 = (values .- rewards2go) .^ 2
+    v_loss2 = (v_clip .- rewards2go) .^ 2
+    v_loss = hp.vf_coef * mean(max.(v_loss1, v_loss2))
+
+    return p_loss + v_loss - entropy
+
+end
+
+function setup_optimisers(lr)
+    opt = ADAM(lr) |> gpu
+    return opt
+end
+
+function setup_model(lr, large, model_n)
+    # load the latest checkpoint or start from scratch if it doesn't exist
+    idx = get_checkpoint_idx(model_n)
+    if idx === nothing
+        # no checkpoints present, create the model critic model
+        if large
+            n1 = 256
+            n2 = 512
+            # create the network
+            cpu_model = Chain(
+                Dense(state_size, n1, tanh),
+                Dense(n1, n2, tanh),
+                Dense(n2, n2, tanh),
+                Dense(n2, n1, tanh),
+                Dense(n1, action_size + 1)
+            )
+        else
+            n1 = 128
+            # create the network
+            cpu_model = Chain(
+                Dense(state_size, n1, tanh),
+                Dense(n1, n1, tanh),
+                Dense(n1, n1, tanh),
+                Dense(n1, action_size + 1)
+            )
+        end
+
+        # create the log standard deviations for the model
+        log_std = Array{Float32}(undef, action_size)
+        for i = eachindex(log_std)
+            log_std[i] = -0.5
+        end
+        idx = 0
+    else
+        base_dir = string(pwd(), "/models/")
+        println("starting training from checkpoint ", idx)
+        @load string(base_dir, "model", model_n, "_", idx, ".bson") cpu_model log_std
     end
-    println("time to update value function: ", now() - st)
-    println()
+
+    # shift to the gpu
+    model = cpu_model |> gpu
+
+    # setup the optimisers
+    opt = setup_optimisers(lr)
+
+    return model, cpu_model, log_std, opt, idx
+end
+
+function update_ac(model, log_std, opt, states, actions, adv, log_probs, r2g, values, hp)
+
+    # update the network
+    ps = Flux.params(model, log_std)
+    for j = 1:hp.n_updates
+        g = gradient(() -> loss(model, log_std, states, actions, adv, log_probs, r2g, values, hp), ps)
+        Flux.update!(opt, ps, g)
+    end
+
     return
 end
 
-function get_checkpoint_idx()
-    # get the array of checkpoints
-    checkpoints = readdir("checkpoints/")
+function get_checkpoint_idx(model_n)
+    
+    # get checkpoints directory 
+    base_dir = string(pwd(), "/models/")
 
-    # get the highest index of the checkpoints
-    idx = 1
-    for i = eachindex(checkpoints)
-        n = parse(Int, match(r"\d+", checkpoints[i]).match)
-        if n > idx
-            idx = n
+    # get the array of checkpoints
+    checkpoints = readdir(base_dir)
+
+    if size(checkpoints)[1] > 0
+        # get the highest index of the checkpoints
+        name = string("model", model_n)
+        r = Regex("$name")
+        idx = 1
+        for i = eachindex(checkpoints)
+            m = match(r, checkpoints[i])
+            if m !== nothing
+                m = match(r"_\d+", checkpoints[i]).match
+                n = parse(Int, match(r"\d", m).match)
+                if n > idx
+                    idx = n
+                end
+            end
         end
+        return idx
+    else
+        return nothing
     end
-    return idx
 end
 
-function choose_opponent(use_gpu::Bool)
+function choose_opponent()
+
+    # get checkpoints directory 
+    base_dir = string(pwd(), "/models/")
 
     # get the potential opponents
-    checkpoints = readdir("checkpoints/")
+    checkpoints = readdir(base_dir)
     sz = size(checkpoints)[1]
 
     if sz > 0
@@ -191,21 +233,98 @@ function choose_opponent(use_gpu::Bool)
         r = floor(Int32, rand() * sz + 1)
         
         # load the opponent
-        println("loading ", checkpoints[r])
-        @load string("checkpoints/", checkpoints[r]) actor act_log_std critic
+        @load string(base_dir, checkpoints[r]) cpu_model log_std
     else
         # no models present yet, create one at random
-        println("no checkpoints available, creating opponent from scratch")
-        actor, act_log_std, act_optimiser, critic, crt_optimiser = setup_model(0.001, use_gpu)
+        cpu_model = nothing
     end
 
-    return actor
+    return cpu_model
 end
 
-function train(hp, use_gpu::Bool)
+function get_batch(model, log_std, gamma_arr, gamma_lam_arr, polar, hp, init_states, init_idx)
 
-    # initialise results file
-    write("training_rewards.csv", "ave_episode_reward\n")
+    # setup data buffers
+    states_buf = Array{Float32}(undef, state_size, hp.batch_size)
+    actions_buf = Array{Float32}(undef, action_size, hp.batch_size)
+    log_probs_buf = Array{Float32}(undef, hp.batch_size)
+    r2g_buf = Array{Float32}(undef, hp.batch_size)
+    adv_buf = Array{Float32}(undef, hp.batch_size)
+    val_buf = Array{Float32}(undef, hp.batch_size)
+
+    # select an opponent
+    opponent = choose_opponent()
+
+    # run a batch of episodes in parallel
+    n_threads = Threads.nthreads()
+    batch_size = floor(Int, hp.batch_size / n_threads)
+    Threads.@threads for i = 1:n_threads
+        states = Array{Float32}(undef, state_size, max_steps)
+        actions = Array{Float32}(undef, action_size, max_steps)
+        values = Array{Float32}(undef, max_steps+1)
+        combined_actions = Array{Float32}(undef, action_size * 2)
+        log_probs = Array{Float32}(undef, max_steps)
+        rewards = Array{Float32}(undef, max_steps)
+        state = Array{Float32}(undef, state_size)
+        norm_state = Array{Float32}(undef, state_size)
+        opp_state = Array{Float32}(undef, state_size)
+        row_buffer = Array{Float32}(undef, floor(Int, 2 / dt))
+        n = 0
+        ts = (i - 1) * batch_size
+        while n < batch_size
+
+            # run an episode
+            sz, init_idx = run_episode(model, log_std, opponent, polar, states, actions, values, combined_actions, log_probs, rewards, state, norm_state, opp_state, row_buffer, init_states, init_idx, hp.c)
+
+            # calculate the rewards to go
+            r2g = discount_cumsum(view(rewards, 1:sz-1), gamma_arr)
+
+            # calculate the advantage estimates
+            δ = view(rewards, 1:sz-1) + hp.γ * view(values, 2:sz) - view(values, 1:sz-1)
+            adv_est = discount_cumsum(δ, gamma_lam_arr)
+
+            # update the buffers
+            s = n + 1
+            sz = min(sz-1, batch_size - n)
+            n += sz
+            states_buf[:, ts+s:ts+n] = view(states, :, 1:sz)
+            actions_buf[:, ts+s:ts+n] = view(actions, :, 1:sz)
+            log_probs_buf[ts+s:ts+n] = view(log_probs, 1:sz)
+            r2g_buf[ts+s:ts+n] = view(r2g, 1:sz)
+            adv_buf[ts+s:ts+n] = view(adv_est, 1:sz)
+            val_buf[ts+s:ts+n] = view(values, 1:sz)
+            
+        end
+    end
+
+    # normalise the advantage estimates
+    μ = mean(adv_buf)
+    σ = std(adv_buf)
+    adv_buf = (adv_buf .- μ) ./ σ
+
+    #shift to the gpu
+    gpu_log_std = log_std |> gpu
+    gpu_states_buf = states_buf |> gpu
+    gpu_actions_buf = actions_buf |> gpu
+    gpu_adv_buf = adv_buf |> gpu
+    gpu_log_probs_buf = log_probs_buf |> gpu
+    gpu_r2g_buf = r2g_buf |> gpu
+    gpu_val_buf = val_buf |> gpu
+
+    return gpu_log_std, gpu_states_buf, gpu_actions_buf, gpu_adv_buf, gpu_log_probs_buf, gpu_r2g_buf, gpu_val_buf, init_idx
+end
+
+function train(hp, exp_name, s3, model_n)
+
+    # get checkpoints directory, create if it doesn't exist
+    base_dir = string(pwd(), "/models/")
+    try
+        mkdir(base_dir)
+    catch
+    end
+
+    # sync with s3
+    n = sync_with_s3(s3, base_dir, exp_name)
 
     # setup arrays to speed up calculation of advantage estimates
     gamma_arr = Array{Float32}(undef, max_steps)
@@ -215,91 +334,45 @@ function train(hp, use_gpu::Bool)
         gamma_lam_arr[i] = (hp.γ * hp.λ)^(i-1)
     end
 
-    # create the actor critic model
-    actor, act_log_std, act_optimiser, critic, crt_optimiser = setup_model(hp.lr, use_gpu)
+    # load the latest checkpoint or start from scratch if it doesn't exist
+    model, cpu_model, log_std, opt, idx = setup_model(hp.lr, hp.large_network, model_n)
 
-    idx = 1
+    # load the polar
+    polar = load_polar("env/polar.csv")
+
+    # initialise the array of problematic reset states
+    init_states = Array{Float32}(undef, state_size, 10000)
+    init_idx = 0
+
+    n_epochs = floor(Int, 1e7 / hp.batch_size)
     while true
         # run n_epochs updates
-        for i = 1:hp.n_epochs
+        for i = 1:n_epochs
             st = now()
 
-            # setup data buffers
-            n = 0
-            states_buf = Array{Float32}(undef, state_size, 0)
-            actions_buf = Array{Float32}(undef, action_size, 0)
-            log_probs_buf = Array{Float32}(undef, action_size, 0)
-            r2g_buf = Array{Float32}(undef, 0)
-            adv_buf = Array{Float32}(undef, 0)
-            sr = 0.0
-            ne = 0.0
-
-            # select an opponent
-            opponent = choose_opponent(use_gpu)
-
-            # run a batch of episodes
-            while n < hp.batch_size
-
-                # run an episode
-                states, actions, log_probs, rewards, values = run_episode(actor, act_log_std, critic, opponent, use_gpu)
-                sr += sum(rewards)
-                ne += 1
-
-                # calculate the rewards to go
-                r2g = discount_cumsum(rewards, gamma_arr)
-
-                # calculate the advantage estimates
-                sz = size(values)[1]
-                δ = view(rewards, 1:sz-1) + hp.γ * view(values, 2:sz) - view(values, 1:sz-1)
-                adv_est = discount_cumsum(δ, gamma_lam_arr)
-
-                # update the buffers
-                states_buf = cat(states_buf, states, dims=2)
-                actions_buf = cat(actions_buf, actions, dims=2)
-                log_probs_buf = cat(log_probs_buf, log_probs, dims=2)
-                r2g_buf = cat(r2g_buf, r2g, dims=1)
-                adv_buf = cat(adv_buf, adv_est, dims=1)
-                n = size(states_buf)[end]
-                
-            end
-
-            sr /= ne
-            println("time to run episodes: ", now() - st)
-            println(i, ", ave rewards per episode: ", sr)
-            open("training_rewards.csv", "a") do io
-                write(io, string(sr, "\n"))
-            end
-
-            # normalise the advantage estimates
-            μ = mean(adv_buf)
-            σ = std(adv_buf)
-            adv_buf = (adv_buf .- μ) ./ σ
-
-            #shift to the gpu
-            if use_gpu
-                actor = actor |> gpu
-                act_log_std = act_log_std |> gpu
-                states_buf = states_buf |> gpu
-                actions_buf = actions_buf |> gpu
-                adv_buf = adv_buf |> gpu
-                log_probs_buf = log_probs_buf |> gpu
-                r2g_buf = r2g_buf |> gpu
-            end
+            # get a batch of data to train on
+            gpu_log_std, states, actions, adv, log_probs, r2g, values, init_idx = get_batch(cpu_model, log_std, gamma_arr, gamma_lam_arr, polar, hp, init_states, init_idx)
             
-            # update the actor critic networks
-            update_ac(actor, act_log_std, act_optimiser, critic, crt_optimiser, states_buf, actions_buf, adv_buf, log_probs_buf, r2g_buf, hp)
-
+            # update the model critic networks
+            update_ac(model, gpu_log_std, opt, states, actions, adv, log_probs, r2g, values, hp)
+            
             # shift back to the cpu
-            if use_gpu
-                actor = actor |> cpu
-                act_log_std = act_log_std |> cpu
-            end
+            cpu_model = model |> cpu
+            log_std = gpu_log_std |> cpu
+
+            # timing for performance
+            print(i, " time: ", now() - st, "\r")
             
         end
 
         # checkpoint the model
-        @save string("checkpoints/model_", idx, ".bson") actor act_log_std critic
         idx += 1
+        model_name = string(base_dir, "model", model_n, "_", idx, ".bson")
+        @save model_name cpu_model log_std
+        s3.upload_file(model_name, s3_bucket, string(exp_name, "/models/model", model_n, "_", idx, ".bson"))
+
+        # sync with s3 to get checkpoints from other instances
+        n = sync_with_s3(s3, base_dir, exp_name)
     end
 end
 
@@ -310,14 +383,19 @@ struct hyper_parameters
     ϵ::Float32
     c::Float32
     lr::Float32
-    n_p_updates
-    n_v_updates
-    batch_size
-    n_epochs
+    ent_coef::Float32
+    vf_coef::Float32
+    d::Float32
+    n_updates::Int32
+    batch_size::Int32
+    large_network::Bool
 end
-hp = hyper_parameters(0.99, 0.97, 0.2, log(sqrt(2 * π)), 3e-4, 10, 10, 10000, 10)
+hp = hyper_parameters(0.99, 0.95, 0.2, log(sqrt(2 * π)), 3e-4, 0.01, 0.25, 0.5 * log(2 * π * ℯ), 10, 100000, true)
+
+# initialise aws setup
+s3 = connect_to_s3()
 
 # run the training
-st = now()
-train(hp, true)
-println("total time: ", now() - st)
+exp_name = ARGS[1]
+model_n = ARGS[2]
+train(hp, exp_name, s3, model_n)

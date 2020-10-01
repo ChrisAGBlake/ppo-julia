@@ -1,6 +1,7 @@
 module PrestartEnv
-export env_step, env_reset, normalise, get_opponent_state, state_size, action_size, dt, max_steps
+export env_step, env_reset, full_reset, normalise, denormalise, get_opponent_state, load_polar, state_size, action_size, dt, max_steps
 using Random
+using CSV
 
 # acceleration coefficients
 const ac1 = 0.035
@@ -11,15 +12,13 @@ const ac5 = 6.77
 const ac6 = 3.68
 const turn_rate_limit = deg2rad(40.0)
 
-# polar velocity coefficients
-const pc1 = -0.934
-const pc2 = 5.178
-const pc3 = -9.64
-const pc4 = 10.485
-const pc5 = -26.54
-const pc6 = 53.012
-const pc7 = -13.634
+# polar velocity
 const vmg_cwa = 0.82
+const min_tws = 7.0 * 1852.0 / 3600.0
+const max_tws = 21.0 * 1852.0 / 3600.0
+const tws_step = 2.0 * 1852.0 / 3600.0
+const v_min = 0.5
+const n_tws = 8
 
 # state indices
 const idx_b1x = 1
@@ -44,7 +43,8 @@ const idx_stb_y = 19
 const idx_row = 20
 const idx_row_1 = 21
 const idx_row_2 = 22
-const state_size = 22
+const idx_tws = 23
+const state_size = 23
 const n_boat_states = 7
 const action_size = 2
 
@@ -61,6 +61,7 @@ const box_depth = 1300.0
 
 # rewards
 const penalty = 0.2
+const game_penalty = 0.05
 const start_penalty = 0.05
 const collision_penalty = 0.05
 
@@ -82,20 +83,61 @@ function limit_pi(val)
     return val
 end
 
-function calc_polar_v(cwa)
+function load_polar(fname)
+    f = CSV.File(fname; header=false, delim=',', type=Float32)
+    polar = Array{Float32}(undef, n_tws, 19)
+    i = 1
+    for row in f
+        j = 1
+        for col in row
+            polar[i,j] = col
+            j += 1
+        end
+        i += 1
+    end
+    return polar
+end
+
+function calc_polar_v(tws, cwa, polar)
+
+    # keep cwa and tws between limits
     if cwa < 0
         cwa *= -1
     end
-    v_polar = pc1 * cwa^6 + pc2 * cwa^5 + pc3 * cwa^4 + pc4 * cwa^3 + pc5 * cwa^2 + pc6 * cwa + pc7
-    if v_polar < 0.5
-        v_polar = 0.5
+    if tws < min_tws
+        tws = min_tws
     end
-    return v_polar
+    if tws > max_tws
+        tws = max_tws
+    end
+    
+    # get the polar velocities for the tws in the table either side of the actual tws
+    i = floor(Int, 1 + (tws - min_tws) / tws_step)
+    if i >= n_tws
+        i = n_tws - 1
+    end
+    j = floor(Int, 1 + cwa * 18 / π)
+    if j > 18
+        j = 18
+    end
+    
+    r = (cwa - (j-1) * π / 18) / (π / 18)
+    v_low = polar[i,j] * (1 - r) + polar[i,j+1] * r
+    v_high = polar[i+1,j] * (1 - r) + polar[i+1,j+1] * r
+    
+    # interpolate between the polar velocities at the two wind speeds
+    r = (tws - (min_tws + (i-1) * tws_step)) / tws_step
+    v = v_low * (1 - r) + v_high * r
+    
+    if v < v_min
+        v = v_min
+    end
+    return v
 end
 
-function calc_acc(tws, cwa, v, turn_rate, disp_action)
+function calc_acc(tws, cwa, v, turn_rate, disp_action, polar)
     # calc polar v
-    v_polar = calc_polar_v(cwa)
+    v_polar = calc_polar_v(tws, cwa, polar)
     if disp_action > 0.5
         v_polar *= 0.7
     end
@@ -110,12 +152,12 @@ function calc_acc(tws, cwa, v, turn_rate, disp_action)
     acc += ac2 * delta_bsp^2
     acc *= (1 - ac3 * delta_cwa)
     if v < ac5 + ac6 && v > ac5 - ac6
-        acc += ac4 + (v - ac5)^2 - ac6^2
+        acc += ac4 * ((v - ac5)^2 - ac6^2)
     end
-
+    
     # add in a deceleration proportional to the turn rate
     acc -= 0.1 * v * abs(turn_rate)
-
+    
     if acc < -2.0
         acc = -2.0
     end
@@ -312,7 +354,7 @@ function over_line(state, idx_x, idx_y)
     return over
 end
 
-function final_dmg(state, b1)
+function final_dmg(state, b1, polar)
     if b1
         x = state[idx_b1x]
         y = state[idx_b1y]
@@ -345,7 +387,7 @@ function final_dmg(state, b1)
         cwa += tr
 
         # acceleration
-        acc = calc_acc(6.17, cwa, v, tr, 0)
+        acc = calc_acc(state[idx_tws], cwa, v, tr, 0, polar)
 
         # update velocity
         v += acc
@@ -368,38 +410,64 @@ function final_dmg(state, b1)
     return y
 end
 
-function calc_reward(state, prev_state, row)
+function calc_reward(state, prev_state, row, polar, scoring_reward::Bool)
     r = 0.0
-    won = 0
-    pnlt = 0
+    won = false
+    pnlt = false
     ################################################################
     # check for infringement
     if overlap(state, virtual_boundary)
         if !overlap(prev_state, virtual_boundary)
-            pnlt = 1
+            pnlt = true
             if row < 0
-                r -= penalty
+                if scoring_reward
+                    r -= game_penalty
+                else
+                    r -= penalty
+                end
             else
-                r += penalty
-                won = 1
+                if scoring_reward
+                    r += game_penalty
+                else
+                    r += penalty
+                end
+                won = true
             end
         end
 
         # check for collisions
         if overlap(state, physical_boundary)
             # if collided, kill episode directly for faster iteration
-            r -= collision_penalty
+            if !scoring_reward
+                r -= collision_penalty
+            end
             return r, pnlt, won, true
         end
     end
 
     ################################################################
     # check for staying in the start box
-    if state[idx_b1y] < -box_depth
-        r -= 0.01
-    end
-    if abs(state[idx_b1x]) > box_width
-        r -= 0.01
+    if scoring_reward
+        if state[idx_b1y] < -box_depth && prev_state[idx_b1y] >= -box_depth
+            r -= game_penalty
+        end
+        if abs(state[idx_b1x]) > box_width && abs(prev_state[idx_b1x]) <= box_width
+            r -= game_penalty
+        end
+
+        if state[idx_b2y] < -box_depth && prev_state[idx_b2y] >= -box_depth
+            r += game_penalty
+        end
+        if abs(state[idx_b2x]) > box_width && abs(prev_state[idx_b2x]) <= box_width
+            r += game_penalty
+        end
+    else
+        if state[idx_b1y] < -box_depth
+            r -= 0.01
+        end
+        if abs(state[idx_b1x]) > box_width
+            r -= 0.01
+        end
     end
 
     ################################################################
@@ -435,10 +503,10 @@ function calc_reward(state, prev_state, row)
             # didn't enter within 30s, penalise it
             if state[idx_b1x] > 0
                 d = √((state[idx_b1x] - state[idx_stb_x])^2 + (state[idx_b1y] - state[idx_stb_y])^2)
-                r -= (start_penalty + d / 1000.)
+                r -= (start_penalty + d / 1000.0)
             else
                 d = √((state[idx_b1x] - state[idx_prt_x])^2 + (state[idx_b1y] - state[idx_prt_y])^2)
-                r -= (start_penalty + d / 1000.)
+                r -= (start_penalty + d / 1000.0)
             end
             state[idx_b1ent] = 1
         end
@@ -486,29 +554,42 @@ function calc_reward(state, prev_state, row)
 
     ################################################################
     # penalise boats for crossing the line early (in the last 20s)
-    if state[idx_t] > prestart_duration - 20 && state[idx_t] <= prestart_duration
-        # boat 1
-        over = over_line(state, idx_b1x, idx_b1y)
-        if over > 0
-            prev_over = over_line(prev_state, idx_b1x, idx_b1y)
-            if prev_over <= 0
-                if line_segment_intersect(prev_state[idx_b1x], prev_state[idx_b1y], state[idx_b1x], state[idx_b1y], state[idx_prt_x], state[idx_prt_y], state[idx_stb_x], state[idx_stb_y]) >= 0
-                    # boat 1 crossed the line before the start
-                    r -= start_penalty
+    if !scoring_reward
+        if state[idx_t] > prestart_duration - 20 && state[idx_t] <= prestart_duration
+            # boat 1
+            over = over_line(state, idx_b1x, idx_b1y)
+            if over > 0
+                prev_over = over_line(prev_state, idx_b1x, idx_b1y)
+                if prev_over <= 0
+                    if line_segment_intersect(prev_state[idx_b1x], prev_state[idx_b1y], state[idx_b1x], state[idx_b1y], state[idx_prt_x], state[idx_prt_y], state[idx_stb_x], state[idx_stb_y]) >= 0
+                        # boat 1 crossed the line before the start
+                        r -= start_penalty
+                    end
                 end
             end
-        end
-        
-        # boat 2
-        over = over_line(state, idx_b2x, idx_b2y)
-        if over > 0
-            prev_over = over_line(prev_state, idx_b2x, idx_b2y)
-            if prev_over <= 0
-                if line_segment_intersect(prev_state[idx_b2x], prev_state[idx_b2y], state[idx_b2x], state[idx_b2y], state[idx_prt_x], state[idx_prt_y], state[idx_stb_x], state[idx_stb_y]) >= 0
-                    # boat 2 crossed the line before the start
-                    r += start_penalty
+            
+            # boat 2
+            over = over_line(state, idx_b2x, idx_b2y)
+            if over > 0
+                prev_over = over_line(prev_state, idx_b2x, idx_b2y)
+                if prev_over <= 0
+                    if line_segment_intersect(prev_state[idx_b2x], prev_state[idx_b2y], state[idx_b2x], state[idx_b2y], state[idx_prt_x], state[idx_prt_y], state[idx_stb_x], state[idx_stb_y]) >= 0
+                        # boat 2 crossed the line before the start
+                        r += start_penalty
+                    end
                 end
             end
+
+            # add rewards for b1 distance ahead of b2 at the gun
+            if state[idx_t] > prestart_duration - dt / 5
+                # get distance of the boats to the line
+                b1_dist = point_to_line_dist(state[idx_prt_x], state[idx_prt_y], state[idx_stb_x], state[idx_stb_y], state[idx_b1x], state[idx_b1y])
+                b2_dist = point_to_line_dist(state[idx_prt_x], state[idx_prt_y], state[idx_stb_x], state[idx_stb_y], state[idx_b2x], state[idx_b2y])
+
+                # add the reward
+                r += 0.2 * (b2_dist - b1_dist) / 1000.0
+            end
+
         end
     end
 
@@ -546,23 +627,33 @@ function calc_reward(state, prev_state, row)
 
         # check for either boat getting to 50m dmg after the start
         if (state[idx_b1y] >= dmg_after_start && state[idx_b1start] > 0.5) || (state[idx_b2y] >= dmg_after_start && state[idx_b2start] > 0.5)
-            r += final_dmg(state, true) / 1000.0
-            r -= final_dmg(state, false) / 1000.0
+            r += final_dmg(state, true, polar) / 1000.0
+            r -= final_dmg(state, false, polar) / 1000.0
             return r, pnlt, won, true
         end
 
         # check for the episode ending because of time running out
         if state[idx_t] >= prestart_duration + max_t_after_start
-            r += final_dmg(state, true) / 1000.0
-            r -= final_dmg(state, false) / 1000.0
+            r += final_dmg(state, true, polar) / 1000.0
+            r -= final_dmg(state, false, polar) / 1000.0
             return r, pnlt, won, true
         end
     end
     return r, pnlt, won, false
 end
 
-function env_step(state, action, row_buffer)
+function env_step(state, action, row_buffer, polar, scoring_reward::Bool)
     prev_state = copy(state)
+
+    ##################################################################
+    # tws
+    state[idx_tws] += (rand() - 0.5) * 0.25
+    if state[idx_tws] < 3.5
+        state[idx_tws] = 3.5
+    end
+    if state[idx_tws] > 11.5
+        state[idx_tws] = 11.5
+    end
 
     ##################################################################
     # boat 1
@@ -572,7 +663,7 @@ function env_step(state, action, row_buffer)
     state[idx_b1cwa] = limit_pi(state[idx_b1cwa])
 
     # longitudinal acceleration
-    acc = calc_acc(6.17, state[idx_b1cwa], state[idx_b1v], state[idx_b1tr], action[2])
+    acc = calc_acc(state[idx_tws], state[idx_b1cwa], state[idx_b1v], state[idx_b1tr], action[2], polar)
 
     # update velocity
     state[idx_b1v] += acc * dt
@@ -589,7 +680,7 @@ function env_step(state, action, row_buffer)
     state[idx_b2cwa] = limit_pi(state[idx_b2cwa])
 
     # longitudinal acceleration
-    acc = calc_acc(6.17, state[idx_b2cwa], state[idx_b2v], state[idx_b2tr], action[4])    
+    acc = calc_acc(state[idx_tws], state[idx_b2cwa], state[idx_b2v], state[idx_b2tr], action[4], polar)    
 
     # update velocity
     state[idx_b2v] += acc * dt
@@ -604,30 +695,43 @@ function env_step(state, action, row_buffer)
     
     ##################################################################
     # calculate the reward for this state for boat 1
-    r, pnlt, won, done = calc_reward(state, prev_state, row_buffer[end])
+    r, pnlt, won, done = calc_reward(state, prev_state, row_buffer[end], polar, scoring_reward)
 
     ##################################################################
     # update right of way
+    row = calc_row(state)
+    state[idx_row_2] = row_buffer[end]
+    state[idx_row_1] = row_buffer[floor(Int, 1 / dt)]
+    state[idx_row] = row
     i = size(row_buffer)[1]
     while i > 1
         row_buffer[i] = row_buffer[i-1]
         i -= 1
     end
-    row_buffer[1] = calc_row(state)
+    row_buffer[1] = row
 
     return r, pnlt, won, done
 end
 
-function env_reset(state, row_buffer)
+function env_reset(state, row_buffer, polar, init_states, init_idx)
+    if init_idx > 100 && rand() > 0.5
+        r = floor(Int, rand() * init_idx) + 1
+        state[:] = view(init_states, :, r)
+        for i = eachindex(row_buffer)
+            row_buffer[i] = state[idx_row]
+        end
+        return
+    end
+
     if rand() > 0.5
-        full_reset(state, row_buffer)
+        full_reset(state, row_buffer, polar)
     else
-        near_start_reset(state, row_buffer)
+        near_start_reset(state, row_buffer, polar)
     end
     return
 end
 
-function full_reset(state, row_buffer)
+function full_reset(state, row_buffer, polar)
     entry_side = 1
 
     # determine if boat 1 enters on port or starboard
@@ -643,6 +747,10 @@ function full_reset(state, row_buffer)
     state[idx_prt_y] = -length * sin(skew) / 2
     state[idx_stb_x] = length * cos(skew) / 2
     state[idx_stb_y] = length * sin(skew) / 2
+
+    ##################################################################
+    # tws
+    state[idx_tws] = 3.5 + rand() * 8
 
     ##################################################################
     # boat 1
@@ -662,7 +770,7 @@ function full_reset(state, row_buffer)
     state[idx_b1tr] = 0
 
     # v
-    state[idx_b1v] = calc_polar_v(state[idx_b1cwa])
+    state[idx_b1v] = calc_polar_v(state[idx_tws], state[idx_b1cwa], polar)
 
     # entered
     state[idx_b1ent] = 0
@@ -689,7 +797,7 @@ function full_reset(state, row_buffer)
     state[idx_b2tr] = 0
 
     # v
-    state[idx_b2v] = calc_polar_v(state[idx_b2cwa])
+    state[idx_b2v] = calc_polar_v(state[idx_tws], state[idx_b2cwa], polar)
 
     # entered
     state[idx_b2ent] = 0
@@ -712,7 +820,7 @@ function full_reset(state, row_buffer)
     end
 end
 
-function near_start_reset(state, row_buffer)
+function near_start_reset(state, row_buffer, polar)
     
     ##################################################################
     # marks
@@ -722,6 +830,10 @@ function near_start_reset(state, row_buffer)
     state[idx_prt_y] = -length * sin(skew) / 2
     state[idx_stb_x] = length * cos(skew) / 2
     state[idx_stb_y] = length * sin(skew) / 2
+
+    ##################################################################
+    # tws
+    state[idx_tws] = 3.5 + rand() * 8
 
     ##################################################################
     # boat 1
@@ -737,7 +849,7 @@ function near_start_reset(state, row_buffer)
     state[idx_b1tr] = 0
 
     # v
-    state[idx_b1v] = calc_polar_v(state[idx_b1cwa])
+    state[idx_b1v] = calc_polar_v(state[idx_tws], state[idx_b1cwa], polar)
 
     # entered
     state[idx_b1ent] = 1
@@ -759,7 +871,7 @@ function near_start_reset(state, row_buffer)
     state[idx_b2tr] = 0
 
     # v
-    state[idx_b2v] = calc_polar_v(state[idx_b2cwa])
+    state[idx_b2v] = calc_polar_v(state[idx_tws], state[idx_b2cwa], polar)
 
     # entered
     state[idx_b2ent] = 1
@@ -805,17 +917,52 @@ function normalise(state)
     state[idx_prt_y] /= 1000
     state[idx_stb_x] /= 1000
     state[idx_stb_y] /= 1000
+
+    # tws
+    state[idx_tws] -= 7.5
+    state[idx_tws] /= 4
     return
 end
 
-function get_opponent_state(state)
-    o_state = copy(state)
-    o_state[1:n_boat_states] = state[n_boat_states+1:n_boat_states*2]
-    o_state[n_boat_states+1:n_boat_states*2] = state[1:n_boat_states]
-    o_state[idx_row] *= -1
-    o_state[idx_row_1] *= -1
-    o_state[idx_row_2] *= -1
-    return o_state
+function denormalise(state)
+    # boat 1
+    state[idx_b1x] *= 1000
+    state[idx_b1y] *= 1000
+    state[idx_b1v] /= 0.06
+    state[idx_b1cwa] *= π
+
+    # boat 2
+    state[idx_b2x] *= 1000
+    state[idx_b2y] *= 1000
+    state[idx_b2v] /= 0.06
+    state[idx_b2cwa] *= π
+
+    # time
+    state[idx_t] -= 1
+    state[idx_t] *= 60
+    state[idx_t] += prestart_duration
+    
+    # marks
+    state[idx_prt_x] *= 1000
+    state[idx_prt_y] *= 1000
+    state[idx_stb_x] *= 1000
+    state[idx_stb_y] *= 1000
+
+    # tws
+    state[idx_tws] *= 4
+    state[idx_tws] += 7.5
+    
+    return
+end
+
+function get_opponent_state(state, opp_state)
+    opp_state[1:n_boat_states] = view(state, n_boat_states+1:n_boat_states*2)
+    opp_state[n_boat_states+1:n_boat_states*2] = view(state, 1:n_boat_states)
+    opp_state[n_boat_states*2+1:state_size] = view(state, n_boat_states*2+1:state_size)
+    opp_state[idx_row] *= -1
+    opp_state[idx_row_1] *= -1
+    opp_state[idx_row_2] *= -1
+    return
 end
 
 end
